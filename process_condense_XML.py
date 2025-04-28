@@ -14,97 +14,165 @@ logger = logging.getLogger(__name__)
 s3_client = boto3.client('s3')
 
 # S3 paths
-input_bucket = 's3_bucket'
+input_bucket = 'eda-search-documents'
 input_prefix = 'contracts/PDS/2025/'
-output_bucket = 's3_bucket'
+output_bucket = 'eda-search-documents'
 output_prefix = 'processed-json-test/'
+pdf_prefix = 'contracts/Award/2025/'
 
 def format_date(date_str):
     return datetime.strptime(date_str, "%Y-%m-%d").strftime("%m/%d/%Y") if date_str else None
+
+def extract_contract_number_from_s3_key(s3_key):
+    match = re.search(r"([A-Za-z0-9]+)_", s3_key)
+    if match:
+        return match.group(1)
+    return None
     
-def insert_json_data(json_data):
-    # Update these with your RDS PostgreSQL connection details.
-    conn = psycopg2.connect(
-        host="RDS DB endpoint",
-        port=5432,
-        dbname="postgres",
-        user="username",
-        password="T***********5"
+def get_s3_uri_for_contract(json_data, input_bucket, pdf_prefix):
+    contract_number = (
+        f"{json_data['enterprise_identifier']}"
+        f"{json_data['year']}"
+        f"{json_data['type_code']}"
+        f"{json_data['serialized_identifier']}"
     )
 
-    if conn.closed == 0:
-        logger.info("Connection is open.")
-    else:
-        logger.error("Connection is closed.")
-        return
+    # List objects in S3
+    response = s3_client.list_objects_v2(Bucket=input_bucket, Prefix=pdf_prefix)
+
+    # Log response structure for debugging
+    logger.info(f"Response from S3: {response}")
+
+    if "Contents" not in response:
+        logger.info("No files found in the specified S3 location.")
+        return None
+
+    # Iterate over objects and check if any match the contract number and is a PDF
+    for obj in response["Contents"]:
+        # Log the type of obj to understand the structure
+        logger.info(f"Processing S3 object: {obj}")
+
+        if isinstance(obj, dict) and "Key" in obj:
+            s3_key = obj["Key"]
+            
+            # Check if the file is a PDF
+            if s3_key.lower().endswith(".pdf"):
+                # Extract the contract number from the S3 key
+                extracted_contract_number = extract_contract_number_from_s3_key(s3_key)
+                
+                if extracted_contract_number == contract_number:
+                    return f"s3://{input_bucket}/{s3_key}"
+            else:
+                logger.warning(f"Skipping non-PDF file: {s3_key}")
+        else:
+            logger.warning(f"Unexpected object structure: {obj}")
+
+    return None
     
-    cursor = conn.cursor()
+def insert_json_data(json_data):
+    contract_number = (
+        f"{json_data['enterprise_identifier']}"
+        f"{json_data['year']}"
+        f"{json_data['type_code']}"
+        f"{json_data['serialized_identifier']}"
+    )
+
+    # Get the S3 URI using the contract number
+    s3_uri = get_s3_uri_for_contract(json_data, input_bucket, pdf_prefix)
 
     try:
-        json_data["contract_number"] = (
-            f"{json_data['enterprise_identifier']}"
-            f"{json_data['year']}"
-            f"{json_data['type_code']}"
-            f"{json_data['serialized_identifier']}"
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            host="eda-contracts-db.c6mhw4szuxuu.us-gov-west-1.rds.amazonaws.com",
+            port=5432,
+            dbname="postgres",
+            user="edaUser",
+            password="TGDPza2LI6NgmsHvpzL5"
         )
-        with conn:
-            with conn.cursor() as cur:
-                # Define the INSERT query
-                sql = """
-                INSERT INTO contract_info_test (
-                    id,
-                    internal_document_number,
-                    procurement_instrument_form,
-                    enterprise_identifier,
-                    year,
-                    type_code,
-                    serialized_identifier,
-                    instrument_vehicle,
-                    pricing_arrangement,
-                    naics_code,
-                    dates_effective_date,
-                    dates_period_start,
-                    dates_period_end,
-                    financial_obligated_amount,
-                    financial_total_contract_value,
-                    contractor_name,
-                    contractor_cage_code,
-                    contractor_duns_number,
-                    metadata_line_items_count,
-                    contract_number
-                )
-                VALUES (
-                    %(id)s,
-                    %(internal_document_number)s,
-                    %(procurement_instrument_form)s,
-                    %(enterprise_identifier)s,
-                    %(year)s,
-                    %(type_code)s,
-                    %(serialized_identifier)s,
-                    %(instrument_vehicle)s,
-                    %(pricing_arrangement)s,
-                    %(naics_code)s,
-                    %(dates_effective_date)s,
-                    %(dates_period_start)s,
-                    %(dates_period_end)s,
-                    %(financial_obligated_amount)s,
-                    %(financial_total_contract_value)s,
-                    %(contractor_name)s,
-                    %(contractor_cage_code)s,
-                    %(contractor_duns_number)s,
-                    %(metadata_line_items_count)s,
-                    %(contract_number)s
-                );
-                """
-                cur.execute(sql, json_data)
-                logger.info(f"Rows inserted: {cur.rowcount}")
-                conn.commit()
-                logger.info("Data inserted successfully.")
+
+        if conn.closed == 0:
+            logger.info("Connection is open.")
+        else:
+            logger.error("Connection is closed.")
+            return
+
+        cursor = conn.cursor()
+
+        try:
+            json_data["contract_number"] = contract_number
+            json_data["s3_uri"] = s3_uri
+
+            with conn:
+                with conn.cursor() as cur:
+                    # Define the INSERT query
+                    sql = """
+                    INSERT INTO contract_info_test (
+                        id,
+                        internal_document_number,
+                        procurement_instrument_form,
+                        enterprise_identifier,
+                        year,
+                        type_code,
+                        serialized_identifier,
+                        instrument_vehicle,
+                        pricing_arrangement,
+                        naics_code,
+                        dates_effective_date,
+                        dates_period_start,
+                        dates_period_end,
+                        financial_obligated_amount,
+                        financial_total_contract_value,
+                        contractor_name,
+                        contractor_cage_code,
+                        contractor_duns_number,
+                        metadata_line_items_count,
+                        contract_number,
+                        s3_uri,
+                        reference_description,
+                        reference_value,
+                        section
+                    )
+                    VALUES (
+                        %(id)s,
+                        %(internal_document_number)s,
+                        %(procurement_instrument_form)s,
+                        %(enterprise_identifier)s,
+                        %(year)s,
+                        %(type_code)s,
+                        %(serialized_identifier)s,
+                        %(instrument_vehicle)s,
+                        %(pricing_arrangement)s,
+                        %(naics_code)s,
+                        %(dates_effective_date)s,
+                        %(dates_period_start)s,
+                        %(dates_period_end)s,
+                        %(financial_obligated_amount)s,
+                        %(financial_total_contract_value)s,
+                        %(contractor_name)s,
+                        %(contractor_cage_code)s,
+                        %(contractor_duns_number)s,
+                        %(metadata_line_items_count)s,
+                        %(contract_number)s,
+                        %(s3_uri)s,
+                        %(reference_description)s,
+                        %(reference_value)s,
+                        %(section)s
+                    );
+                    """
+                    cur.execute(sql, json_data)
+                    logger.info(f"Rows inserted: {cur.rowcount}")
+                    conn.commit()
+                    logger.info("Data inserted successfully.")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error inserting data: {e}")
+        finally:
+            conn.close()
+
     except Exception as e:
-        conn.rollback()
-        logger.error(f"Error inserting data: {e}")
-    finally:
-        conn.close()
+        logger.error(f"Failed to connect to the database: {e}")
+
+	
 
 def extract_id_from_file(file_key):
     parts = file_key.split('/')
@@ -126,7 +194,8 @@ def extract_essential_contract_data(root):
         "dates": {},
         "financial": {},
         "contractor": {},
-        "line_items": []
+        "line_items": [],
+        "reference_data":{}
     }
 
     ns = {"": root.tag.split('}')[0].strip('{') if '}' in root.tag else ""}
@@ -136,6 +205,19 @@ def extract_essential_contract_data(root):
         "internal_document_number": find_element(root, "OriginatorDetails/InternalDocumentNumber"),
         "procurement_instrument_form": find_element(root, "ProcurementInstrumentForm")
     }
+    
+    # Extract Reference Information
+    reference_description = find_element(root, ".//ReferenceDescription")
+    reference_value = find_element(root, ".//ReferenceValue")
+    section = find_element(root, ".//Section")
+
+    if reference_description:
+        contract_data["reference_data"]["reference_description"] = reference_description
+    if reference_value:
+        contract_data["reference_data"]["reference_value"] = reference_value
+    if section:
+        contract_data["reference_data"]["section"] = section
+
 
     award_instrument = root.find(".//AwardInstrument") or root.find(".//AwardModificationInstrument")
     if award_instrument is None:
@@ -190,9 +272,6 @@ def extract_essential_contract_data(root):
             "obligated_amount": obligated_amount,
             "total_contract_value": total_value
         }
-        
-        # obligated_amount = financial.get("obligated_amount", "$0").replace("$", "")
-        # total_contract_value = financial.get("total_contract_value", "$0").replace("$", "")
 
     # Extract Essential Contractor Information
     contractor_address = None
@@ -275,6 +354,12 @@ def flatten_essential_contract_data(contract_data):
 
     if "line_items" in contract_data:
         flattened["metadata_line_items_count"] = len(contract_data["line_items"])
+        
+    if "reference_data" in contract_data:
+        reference_data = contract_data["reference_data"]
+        flattened["reference_description"] = reference_data.get("reference_description")
+        flattened["reference_value"] = reference_data.get("reference_value")
+        flattened["section"] = reference_data.get("section")
 
     return flattened
 
@@ -347,44 +432,6 @@ def process_xml_file(file_key):
     return None  # Return None if processing fails
 
 
-# def process_xml_file(file_key):
-#     if file_key in processed_files:
-#         logger.info(f"Skipping already processed file: {file_key}")
-#         return None
-#     processed_files.add(file_key)
-
-#     try:
-#         logger.info(f"Processing file: {file_key}")
-
-#         # Get the XML content from S3
-#         response = s3_client.get_object(Bucket=input_bucket, Key=file_key)
-#         xml_content = response['Body'].read().decode('utf-8')
-
-#         # Parse the XML content
-#         root = ET.fromstring(xml_content)
-
-#         logger.info(f"Successfully fetched and parsed: {file_key}")
-        
-#         # Extract and flatten the data
-#         contract_data = extract_essential_contract_data(root)
-#         if contract_data is None:
-#             logger.error(f"Failed to extract data for {file_key}")
-#             return None
-
-#         flattened_data = flatten_essential_contract_data(contract_data)
-
-#         # Use the entire file_key as the id (including extension)
-#         flattened_data['id'] = file_key
-
-#         return json.dumps(flattened_data, indent=4)
-
-#     except ET.ParseError as e:
-#         logger.error(f"XML ParseError in {file_key}: {e}")
-#     except Exception as e:
-#         logger.error(f"Unexpected error processing {file_key}: {e}")
-
-#     return None  # Return None if processing fails
-
 def process_files(s3_client, conn, bucket_name, prefix):
     """
     Scans and processes XML files in the given S3 bucket prefix.
@@ -433,26 +480,41 @@ def list_xml_files():
     logger.info(f"Total XML files found: {len(files)}")
     return files
 
-
 def main():
     xml_files = list_xml_files()
     count = 0
     for file_key in xml_files:
-        json_data = process_xml_file(file_key)
+        json_data = process_xml_file(file_key)  # This returns a JSON string
         count += 1
-        if json_data:  
+
+        if not json_data:
+            logger.warning(f"Skipping file {file_key} due to empty or None JSON data.")
+            continue
+
+        try:
+            # Parse the JSON string into a dictionary
             data_dict = json.loads(json_data)
-            insert_json_data(data_dict)
-            output_file_key = f"{output_prefix}{data_dict['id']}.json"
-            
-            # Upload the JSON data to S3
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON for {file_key}: {e}")
+            continue  
+
+        # Insert the data into the database
+        insert_json_data(data_dict)
+
+        # Create the S3 output file key
+        output_file_key = f"{output_prefix}{data_dict['id']}.json"
+
+        # Upload the JSON data to S3
+        try:
             s3_client.put_object(Bucket=output_bucket, Key=output_file_key, Body=json_data)
-            
             logger.info(f"Processed and uploaded: {output_file_key}")
-        else:
-            logger.warning(f"Skipping upload for {file_key} due to processing failure.")
+        except Exception as e:
+            logger.error(f"Error uploading {output_file_key} to S3: {e}")
+            continue
+
     return count
 
 if __name__ == '__main__':
     count = main()
     logger.info(f"Total processed files: {count}")
+
